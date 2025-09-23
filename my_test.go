@@ -22,16 +22,39 @@ func TestDeploy(t *testing.T) {
 	defer cleanup(t, options)
 
 	// Deploy and verify "terraform apply"
+	afterTerraformApply := applyAndVerify(t, options)
+
+	// Wait for things to settle
+	queryParam := `--query=forEach(units, unit => unit.life=="alive" && unit.workload-status=="active" && unit.agent-status=="idle")`
+	cmd, err, afterApplyWait := waitAfterApply(t, queryParam, afterTerraformApply)
+
+	/*
+		To do later: run verification check re: what was actually deployed.
+		Maybe a "juju export-bundle" comparison tool (versus an expected state, with
+		certain fields being ignored) might be a way to accomplish this.
+	*/
+
+	// Tear down and verify "terraform destroy"
+	afterTerraformDestroy := destroyAndVerify(t, options, afterApplyWait)
+
+	// Verify that everything is really torn down...
+	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
+	// Is there a better invocation for tracking the destroy case specifically?
+	waitAfterDestroy(t, cmd, err, afterTerraformDestroy)
+}
+
+func applyAndVerify(t *testing.T, options *terraform.Options) time.Time {
 	startTime := time.Now()
 	applyOutput := terraform.InitAndApply(t, options)
 	afterTerraformApply := time.Now()
 	terraformApplyTime := afterTerraformApply.Sub(startTime)
 	t.Logf("Initial terraform apply time: %v\n", terraformApplyTime)
 	verifyApply(t, applyOutput)
+	return afterTerraformApply
+}
 
-	// Wait for things to settle
-	cmd := exec.Command("juju", "wait-for", "model", "main",
-		`--query=forEach(units, unit => unit.life=="alive" && unit.workload-status=="active" && unit.agent-status=="idle")`)
+func waitAfterApply(t *testing.T, queryParam string, afterTerraformApply time.Time) (*exec.Cmd, error, time.Time) {
+	cmd := exec.Command("juju", "wait-for", "model", "main", queryParam)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
@@ -41,23 +64,19 @@ func TestDeploy(t *testing.T) {
 	afterApplyWait := time.Now()
 	afterApplyTime := afterApplyWait.Sub(afterTerraformApply)
 	t.Logf("Post-apply time waiting until model settled: %v\n", afterApplyTime)
+	return cmd, err, afterApplyWait
+}
 
-	/*
-		To do later: run verification check re: what was actually deployed.
-		Maybe a "juju export-bundle" comparison tool (versus an expected state, with
-		certain fields being ignored) might be a way to accomplish this.
-	*/
-
-	// Tear down and verify "terraform destroy"
+func destroyAndVerify(t *testing.T, options *terraform.Options, afterApplyWait time.Time) time.Time {
 	destroyOutput := terraform.Destroy(t, options)
 	afterTerraformDestroy := time.Now()
 	terraformDestroyTime := afterTerraformDestroy.Sub(afterApplyWait)
 	t.Logf("Terraform destroy time: %v\n", terraformDestroyTime)
 	verifyDestroy(t, destroyOutput)
+	return afterTerraformDestroy
+}
 
-	// Verify that everything is really torn down...
-	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
-	// Is there a better invocation for tracking the destroy case specifically?
+func waitAfterDestroy(t *testing.T, cmd *exec.Cmd, err error, afterTerraformDestroy time.Time) {
 	cmd = exec.Command("juju", "wait-for", "model", "main")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
