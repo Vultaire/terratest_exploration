@@ -1,0 +1,3 @@
+provider "juju" {
+  # Configuration options
+}
