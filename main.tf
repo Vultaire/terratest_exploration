@@ -1,5 +1,8 @@
 resource "juju_model" "main" {
     name = "main"
+    cloud {
+        name = "localhost"
+    }
 }
 
 resource "juju_application" "ubuntu" {

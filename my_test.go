@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gruntwork-io/terratest/modules/terraform"
 )
@@ -18,11 +19,15 @@ func TestDeploy(t *testing.T) {
 	})
 
 	// Fallback cleanup
-	defer terraform.Destroy(t, options)
+	defer cleanup(t, options)
 
 	// Deploy and verify "terraform apply"
-	apply_output := terraform.InitAndApply(t, options)
-	verifyApply(t, apply_output)
+	startTime := time.Now()
+	applyOutput := terraform.InitAndApply(t, options)
+	afterTerraformApply := time.Now()
+	terraformApplyTime := afterTerraformApply.Sub(startTime)
+	t.Logf("Initial terraform apply time: %v\n", terraformApplyTime)
+	verifyApply(t, applyOutput)
 
 	// Wait for things to settle
 	cmd := exec.Command("juju", "wait-for", "model", "main",
@@ -33,39 +38,22 @@ func TestDeploy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error waiting for the model to settle")
 	}
-
-	// // WIP: Verify some stuff about the deployed environment.
-	// // (Do we care right now?)
-	// var v any
-	// if err := json.NewDecoder(strings.NewReader(stdout.String())).Decode(&v); err != nil {
-	// 	t.Fatalf("JSON decode error: %v\n", stderr.String())
-	// }
-	// log.Printf("%#v\n", v)
-
-	// * Are all the things present as requested?  -> would need to know what's been requested.
-	// * Are all units in active/idle state?
-	//   * If not, are there known exceptions or things being ignored?
-	//   * If still not: repeat for N seconds until timeout hit?
-	//
-	/*
-		At JSON level:
-		* applications.ubuntu."application-status".current: active
-		* applications.ubuntu.units."ubuntu/0"."juju-status".current: idle
-		* applications.ubuntu.units."ubuntu/0"."workload-status".current: active
-	*/
-	//
-	// For v1.0+: it should be in a good state once terraform returns.
-	// For earlier: it'll kick things off but won't wait.
+	afterApplyWait := time.Now()
+	afterApplyTime := afterApplyWait.Sub(afterTerraformApply)
+	t.Logf("Post-apply time waiting until model settled: %v\n", afterApplyTime)
 
 	/*
-		Long story short: how deep of verification do we need here?
-		* Immediately *requested* tests: deploy, maybe upgrade, verify that it doesn't break
-
+		To do later: run verification check re: what was actually deployed.
+		Maybe a "juju export-bundle" comparison tool (versus an expected state, with
+		certain fields being ignored) might be a way to accomplish this.
 	*/
 
 	// Tear down and verify "terraform destroy"
-	destroy_output := terraform.Destroy(t, options)
-	verifyDestroy(t, destroy_output)
+	destroyOutput := terraform.Destroy(t, options)
+	afterTerraformDestroy := time.Now()
+	terraformDestroyTime := afterTerraformDestroy.Sub(afterApplyWait)
+	t.Logf("Terraform destroy time: %v\n", terraformDestroyTime)
+	verifyDestroy(t, destroyOutput)
 
 	// Verify that everything is really torn down...
 	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
@@ -77,89 +65,85 @@ func TestDeploy(t *testing.T) {
 	if err != nil {
 		t.Fatal("Error waiting for the model to settle")
 	}
+	afterDestroyWait := time.Now()
+	afterDestroyTime := afterDestroyWait.Sub(afterTerraformDestroy)
+	t.Logf("Post-apply time waiting until model settled: %v\n", afterDestroyTime)
 }
 
-func verifyApply(t *testing.T, apply_output string) {
+func verifyApply(t *testing.T, applyOutput string) {
 	// Verify that we see a successful apply.
 	// e.g. "Apply complete! Resources: 2 added, 0 changed, 0 destroyed."
 	rgx := regexp.MustCompile(`^Apply complete! Resources: (\d+) added, (\d+) changed, (\d+) destroyed.$`)
-	scanner := bufio.NewScanner(strings.NewReader(apply_output))
-	apply_completed := false
+	scanner := bufio.NewScanner(strings.NewReader(applyOutput))
+	applyCompleted := false
 	for scanner.Scan() {
 		groups := rgx.FindStringSubmatch(scanner.Text())
 		if groups != nil {
-			apply_completed = true
+			applyCompleted = true
 
-			ints := make([]int, 3)
+			ints := []int{}
 			for i := 0; i < 3; i++ {
 				j, err := strconv.Atoi(groups[i+1])
 				if err != nil {
 					t.Fatal(err)
 				}
-				ints[i] = j
+				ints = append(ints, j)
 			}
 			added, changed, destroyed := ints[0], ints[1], ints[2]
 			if added == 0 {
-				t.Fatal(`Unexpected zero "added" count`)
+				t.Fatal(`Zero "added" count on apply`)
 			}
 			if changed > 0 {
-				t.Fatal(`Non-zero "changed" count on initial apply`)
+				t.Fatal(`Non-zero "changed" count on apply`)
 			}
 			if destroyed > 0 {
-				t.Fatal(`Non-zero "destroyed" count on initial apply`)
+				t.Fatal(`Non-zero "destroyed" count on apply`)
 			}
 			break
 		}
 	}
-	if !apply_completed {
+	if !applyCompleted {
 		// Unlikely unless environment is set to a non-English locale, since
 		// actual apply errors will normally be caught by terratest.
 		t.Fatal(`Did not find expected string; please use "C" locale`)
 	}
-	// fmt.Println("======================================================================")
-	// fmt.Println(apply_output)
-	// fmt.Println("======================================================================")
 }
 
-func verifyDestroy(t *testing.T, apply_output string) {
-	return
+func verifyDestroy(t *testing.T, applyOutput string) {
 	// Verify that we see a successful apply.
 	// e.g. "Apply complete! Resources: 2 added, 0 changed, 0 destroyed."
 	rgx := regexp.MustCompile(`^Destroy complete! Resources: (\d+) destroyed.$`)
-	scanner := bufio.NewScanner(strings.NewReader(apply_output))
-	apply_completed := false
+	scanner := bufio.NewScanner(strings.NewReader(applyOutput))
+	applyCompleted := false
 	for scanner.Scan() {
 		groups := rgx.FindStringSubmatch(scanner.Text())
 		if groups != nil {
-			apply_completed = true
-
-			ints := make([]int, 3)
-			for i := 0; i < 3; i++ {
-				j, err := strconv.Atoi(groups[i+1])
-				if err != nil {
-					t.Fatal(err)
-				}
-				ints[i] = j
+			applyCompleted = true
+			destroyed, err := strconv.Atoi(groups[1])
+			if err != nil {
+				t.Fatal(err)
 			}
-			added, changed, destroyed := ints[0], ints[1], ints[2]
-			if added == 0 {
-				t.Fatal(`Unexpected zero "added" count`)
-			}
-			if changed > 0 {
-				t.Fatal(`Non-zero "changed" count on initial apply`)
-			}
-			if destroyed > 0 {
-				t.Fatal(`Non-zero "destroyed" count on initial apply`)
+			if destroyed == 0 {
+				t.Fatal(`Zero "destroyed" count on destroy`)
 			}
 			break
 		}
 	}
-	if !apply_completed {
+	if !applyCompleted {
 		// Unlikely unless environment is set to a non-English locale, since
 		// actual apply errors will normally be caught by terratest.
 		t.Fatal(`Did not find expected string; please use "C" locale`)
 	}
-	// fmt.Println("======================================================================")
-	// fmt.Println(apply_output)
-	// fmt.Println("======================================================================")
+}
+
+func cleanup(t *testing.T, options *terraform.Options) {
+	t.Log("Cleanup: destroying model (if not already destroyed)")
+	t.Log("         * Terraform-level destroy")
+	terraform.Destroy(t, options)
+	// Verify that everything is really torn down...
+	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
+	// Is there a better invocation for tracking the destroy case specifically?
+	t.Log(`         * "juju wait-for"`)
+	cmd := exec.Command("juju", "wait-for", "model", "main")
+	cmd.Run() // Ignore the result
 }
