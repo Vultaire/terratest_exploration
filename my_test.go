@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -57,23 +56,13 @@ func TestApplyUpgradeAndDestroy(t *testing.T) {
 		TerraformDir: ".",
 	})
 
-	defer cleanupUpgradeTest(t, options)
+	//defer cleanupUpgradeTest(t, options)
 
-	/* versions.tf modifications:
-	* Backup to versions.tf.bak.original.
-	* Update to initial deploy version.
-	* Apply.
-	* Backup to versions.tf.bak.applied.
-	* Update to upgraded version.
-	* Re-apply and verify no updates.
-	* Destroy.
-	* Restore versions.tf.bak.applied.
-	* Fallback destroy.
-	* Restore versions.tf.bak.original
-	 */
+	// Fallback cleanup
+	defer cleanup(t, options)
 
-	deployVersion := "0.22.0"
-	upgradeVersion := "v1.0.0-beta2"
+	providerStartVersion := "0.22.0"
+	providerUpgradeRef := "v1.0.0-beta2"
 
 	versionsTf := "versions.tf"
 
@@ -81,29 +70,34 @@ func TestApplyUpgradeAndDestroy(t *testing.T) {
 	versionsTfOriginalBackup := "versions.tf.bak.original"
 	copyFile(versionsTf, versionsTfOriginalBackup)
 	defer copyFile(versionsTfOriginalBackup, versionsTf)
-	writeVersionsTf(versionsTf, deployVersion)
+	writeVersionsTf(versionsTf, providerStartVersion)
 
 	// Deploy and verify "terraform apply"
-	afterTerraformApply := applyAndVerify(t, options)
+	applyTimestamp := applyAndVerify(t, options)
 
 	// Wait for things to settle
 	queryParam := `--query=forEach(units, unit => unit.life=="alive" && unit.workload-status=="active" && unit.agent-status=="idle")`
-	afterApplyWait := waitAfterApply(t, queryParam, afterTerraformApply)
-
-	// // Update provider version
-	// versionsTfAppliedBackup := "versions.tf.bak.applied"
-	// copyFile(versionsTf, versionsTfAppliedBackup)
-	// defer copyFile(versionsTfOriginalBackup, versionsTf)
-	// writeVersionsTf(versionsTf, upgradeVersion)
+	applyWaitTimestamp := waitAfterApply(t, queryParam, applyTimestamp)
 
 	// Build custom provider
-	err := buildCustomProvider(t, upgradeVersion, deployVersion)
+	t.Log("Creating build dir")
+	buildDir, err := os.MkdirTemp("", "builddir")
 	if err != nil {
-		t.Fatalf("Unable to build custom provider version %s: %s", upgradeVersion, err)
+		t.Fatalf("Error setting up tempdir for building custom provider: %s", err)
 	}
+	defer os.RemoveAll(buildDir)
+	t.Logf("Building provider from source code, reference %s", providerUpgradeRef)
+	terraformRcPath := buildCustomProvider(t, providerStartVersion, providerUpgradeRef, buildDir)
+
+	options.EnvVars = map[string]string{
+		"TF_CLI_CONFIG_FILE": terraformRcPath,
+	}
+	defer func() {
+		options.EnvVars = nil
+	}()
 
 	// Re-apply and verify no changes
-	afterTerraformReApply := applyAndReVerify(t, options, afterApplyWait)
+	reApplyTimestamp := applyAndReVerify(t, options, applyWaitTimestamp)
 
 	/*
 		To do later: run verification check re: what was actually deployed.
@@ -112,12 +106,12 @@ func TestApplyUpgradeAndDestroy(t *testing.T) {
 	*/
 
 	// Tear down and verify "terraform destroy"
-	afterTerraformDestroy := destroyAndVerify(t, options, afterTerraformReApply)
+	destroyTimestamp := destroyAndVerify(t, options, reApplyTimestamp)
 
 	// Verify that everything is really torn down...
 	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
 	// Is there a better invocation for tracking the destroy case specifically?
-	waitAfterDestroy(t, afterTerraformDestroy)
+	waitAfterDestroy(t, destroyTimestamp)
 }
 
 func applyAndVerify(t *testing.T, options *terraform.Options) time.Time {
@@ -148,7 +142,7 @@ func waitAfterApply(t *testing.T, queryParam string, lastTimestamp time.Time) ti
 // 	buildCustomProvider(t, "v1.0.0-beta2", "0.22.0")
 // }
 
-func buildCustomProvider(t *testing.T, version string, currentVersion string) error {
+func buildCustomProvider(t *testing.T, previousVersion string, gitRef string, buildDir string) string {
 	/*
 		Pseudocode:
 		* Ensure we have prereqs
@@ -170,20 +164,13 @@ func buildCustomProvider(t *testing.T, version string, currentVersion string) er
 		}
 	}
 
-	t.Log("Creating temp dir")
-	dname, err := os.MkdirTemp("", "builddir")
-	if err != nil {
-		t.Fatalf("Error setting up tempdir for building custom provider: %s", err)
-	}
-	defer os.RemoveAll(dname)
-
 	t.Log("Performing shallow clone of provider repo")
-	cmd := exec.Command("git", "clone", "--depth", "1", "--branch", version,
+	cmd := exec.Command("git", "clone", "--depth", "1", "--branch", gitRef,
 		"https://github.com/juju/terraform-provider-juju.git")
-	cmd.Dir = dname
+	cmd.Dir = buildDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err = cmd.Run()
+	err := cmd.Run()
 	if err != nil {
 		t.Fatalf("Error cloning terraform-provider-juju repo: %s", err)
 	}
@@ -192,12 +179,11 @@ func buildCustomProvider(t *testing.T, version string, currentVersion string) er
 	makeCommands := [][]string{
 		{"make", "install-dependencies"},
 		{"make", "go-install"}, /* builds into gopath */
-		{"make", "install", fmt.Sprintf("EDGE_VERSION=%s", currentVersion)}, /* replaces existing provider */
 	}
 	for _, makeCommand := range makeCommands {
 		t.Logf("Running command: %v", makeCommand)
 		cmd = exec.Command(makeCommand[0], makeCommand[1:]...) // Will this work sanely on our builders?
-		cmd.Dir = filepath.Join(dname, "terraform-provider-juju")
+		cmd.Dir = filepath.Join(buildDir, "terraform-provider-juju")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		err = cmd.Run()
@@ -206,42 +192,28 @@ func buildCustomProvider(t *testing.T, version string, currentVersion string) er
 		}
 	}
 
-	t.Log("Removing the old .terraform.lock.hcl file")
-	os.Remove(".terraform.lock.hcl")
-
-	return err
-}
-
-func cleanupUpgradeTest(t *testing.T, options *terraform.Options) {
-	// Remove the lock file; it may have references to the custom-built provider, which we don't want to keep.
-	t.Logf("Cleanup: removing Terraform lock file")
-	os.Remove(".terraform.lock.hcl")
-
-	// t.Logf("Cleanup: removing terraform.tfstate (if not already purged)")
-	// os.Remove("terraform.tfstate")
-
-	t.Logf("Cleanup: removing .terraform (if not already purged)")
-	os.RemoveAll(".terraform")
-
-	// Remove the juju provider; we want to make sure we set it up from scratch on the next build.
-	user, err := user.Current()
+	t.Log("Getting GOPATH")
+	stdout, err := exec.Command("go", "env", "GOPATH").CombinedOutput()
 	if err != nil {
-		t.Fatalf("Could not pull current user: %s", err)
+		t.Fatalf("Could not determine GOPATH")
 	}
-	providerDir := filepath.Join(user.HomeDir, ".terraform.d", "plugins", "registry.terraform.io", "juju", "juju")
-	t.Logf("Cleanup: purging Terraform juju provider from ~/.terraform.d/plugins/")
-	os.RemoveAll(providerDir)
+	goPath := strings.TrimSpace(string(stdout))
 
-	// Re-run terraform init just for the sake of running cleanup
-	terraform.Init(t, options)
-
-	// Fallback to the normal cleanup code
-	cleanup(t, options)
-
-	/*
-		To do: use **THIS METHOD** instead for building/running a development provider:
-		https://developer.hashicorp.com/terraform/cli/config/config-file#provider-installation
-	*/
+	t.Log("Creating custom Terraform RC to provide dev_override for juju/juju")
+	// NOTE: It may be better to leverage TF_CLI_CONFIG_FILE for this.
+	terraformRc := filepath.Join(buildDir, "dev_overrides.tfrc")
+	output, err := os.OpenFile(terraformRc, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		log.Fatalf("Could not open %s: %s", terraformRc, err)
+	}
+	defer output.Close()
+	output.WriteString(fmt.Sprintf(`provider_installation {
+    dev_overrides {
+        "juju/juju" = "%s"
+    }
+    direct {}
+}`, filepath.Join(goPath, "bin")))
+	return terraformRc
 }
 
 func applyAndReVerify(t *testing.T, options *terraform.Options, lastTimestamp time.Time) time.Time {
@@ -385,10 +357,12 @@ func copyFile(source string, dest string) {
 	if err != nil {
 		log.Fatalf("Could not open source %s: %s", source, err)
 	}
+	defer input.Close()
 	output, err := os.Create(dest)
 	if err != nil {
 		log.Fatalf("Could not open destination %s: %s", dest, err)
 	}
+	defer output.Close()
 	_, err = io.Copy(output, input)
 	if err != nil {
 		log.Fatalf("Unexpected error on io.Copy: %s", err)
