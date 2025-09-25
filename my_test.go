@@ -3,7 +3,6 @@ package test
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -22,15 +21,12 @@ func TestApplyAndDestroy(t *testing.T) {
 		TerraformDir: ".",
 	})
 
-	// Fallback cleanup
-	defer cleanup(t, options)
-
-	// Deploy and verify "terraform apply"
-	afterTerraformApply := applyAndVerify(t, options)
-
-	// Wait for things to settle
+	writeVersionsTf("0.22.0")
+	defer os.Remove("versions.tf")
+	defer cleanup(t, options) // Fallback cleanup in case of errors
+	applyTimestamp := applyAndVerify(t, options)
 	queryParam := `--query=forEach(units, unit => unit.life=="alive" && unit.workload-status=="active" && unit.agent-status=="idle")`
-	afterApplyWait := waitAfterApply(t, queryParam, afterTerraformApply)
+	applyWaitTimestamp := waitAfterApply(t, queryParam, applyTimestamp)
 
 	/*
 		To do later: run verification check re: what was actually deployed.
@@ -38,44 +34,22 @@ func TestApplyAndDestroy(t *testing.T) {
 		certain fields being ignored) might be a way to accomplish this.
 	*/
 
-	// Tear down and verify "terraform destroy"
-	afterTerraformDestroy := destroyAndVerify(t, options, afterApplyWait)
-
-	// Verify that everything is really torn down...
-	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
-	// Is there a better invocation for tracking the destroy case specifically?
-	waitAfterDestroy(t, afterTerraformDestroy)
+	destroyTimestamp := destroyAndVerify(t, options, applyWaitTimestamp)
+	waitAfterDestroy(t, destroyTimestamp)
 }
 
 func TestApplyUpgradeAndDestroy(t *testing.T) {
-	// The procedure for testing with the non-released version is pretty hacky;
-	// the current way to enable this is to build it as a drop-in replacement
-	// for an officially released, and then blow everything away after the test
-	// is done.
 	options := terraform.WithDefaultRetryableErrors(t, &terraform.Options{
 		TerraformDir: ".",
 	})
 
-	//defer cleanupUpgradeTest(t, options)
-
-	// Fallback cleanup
-	defer cleanup(t, options)
-
 	providerStartVersion := "0.22.0"
 	providerUpgradeRef := "v1.0.0-beta2"
 
-	versionsTf := "versions.tf"
-
-	// Backup and queue restore of versions.tf
-	versionsTfOriginalBackup := "versions.tf.bak.original"
-	copyFile(versionsTf, versionsTfOriginalBackup)
-	defer copyFile(versionsTfOriginalBackup, versionsTf)
-	writeVersionsTf(versionsTf, providerStartVersion)
-
-	// Deploy and verify "terraform apply"
+	writeVersionsTf(providerStartVersion)
+	defer os.Remove("versions.tf")
+	defer cleanup(t, options) // Fallback cleanup in case of errors
 	applyTimestamp := applyAndVerify(t, options)
-
-	// Wait for things to settle
 	queryParam := `--query=forEach(units, unit => unit.life=="alive" && unit.workload-status=="active" && unit.agent-status=="idle")`
 	applyWaitTimestamp := waitAfterApply(t, queryParam, applyTimestamp)
 
@@ -89,6 +63,7 @@ func TestApplyUpgradeAndDestroy(t *testing.T) {
 	t.Logf("Building provider from source code, reference %s", providerUpgradeRef)
 	terraformRcPath := buildCustomProvider(t, providerStartVersion, providerUpgradeRef, buildDir)
 
+	// Tweak config to use the custom provider (until test teardown)
 	options.EnvVars = map[string]string{
 		"TF_CLI_CONFIG_FILE": terraformRcPath,
 	}
@@ -96,7 +71,6 @@ func TestApplyUpgradeAndDestroy(t *testing.T) {
 		options.EnvVars = nil
 	}()
 
-	// Re-apply and verify no changes
 	reApplyTimestamp := applyAndReVerify(t, options, applyWaitTimestamp)
 
 	/*
@@ -105,12 +79,7 @@ func TestApplyUpgradeAndDestroy(t *testing.T) {
 		certain fields being ignored) might be a way to accomplish this.
 	*/
 
-	// Tear down and verify "terraform destroy"
 	destroyTimestamp := destroyAndVerify(t, options, reApplyTimestamp)
-
-	// Verify that everything is really torn down...
-	// This doesn't seem ideal (it only works if the destroy is indeed in progress).
-	// Is there a better invocation for tracking the destroy case specifically?
 	waitAfterDestroy(t, destroyTimestamp)
 }
 
@@ -125,13 +94,11 @@ func applyAndVerify(t *testing.T, options *terraform.Options) time.Time {
 }
 
 func waitAfterApply(t *testing.T, queryParam string, lastTimestamp time.Time) time.Time {
-	cmd := exec.Command("juju", "wait-for", "model", "main", queryParam)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		t.Fatalf("Error waiting for the model to settle")
-	}
+	runCommand(
+		t,
+		[]string{"juju", "wait-for", "model", "main", queryParam},
+		"",
+		"Error waiting for the model to settle: %s")
 	timestamp := time.Now()
 	duration := timestamp.Sub(lastTimestamp)
 	t.Logf("Post-apply time waiting until model settled: %v\n", duration)
@@ -155,25 +122,18 @@ func buildCustomProvider(t *testing.T, previousVersion string, gitRef string, bu
 	// Check for prereqs which aren't handled by the Makefile
 	requiredExecutables := []string{"make", "yq"}
 	for _, executable := range requiredExecutables {
-		cmd := exec.Command("which", executable)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Run()
-		if err != nil {
-			t.Fatalf("Did not find prerequisite executable: %s", executable)
-		}
+		runCommand(t,
+			append([]string{"which"}, executable),
+			"",
+			fmt.Sprintf("Did not find prerequisite executable: %s", executable))
 	}
 
 	t.Log("Performing shallow clone of provider repo")
-	cmd := exec.Command("git", "clone", "--depth", "1", "--branch", gitRef,
-		"https://github.com/juju/terraform-provider-juju.git")
-	cmd.Dir = buildDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		t.Fatalf("Error cloning terraform-provider-juju repo: %s", err)
-	}
+
+	runCommand(t,
+		[]string{"git", "clone", "--depth", "1", "--branch", gitRef, "https://github.com/juju/terraform-provider-juju.git"},
+		buildDir,
+		"Error cloning terraform-provider-juju repo: %s")
 
 	t.Log("Building the provider")
 	makeCommands := [][]string{
@@ -182,14 +142,10 @@ func buildCustomProvider(t *testing.T, previousVersion string, gitRef string, bu
 	}
 	for _, makeCommand := range makeCommands {
 		t.Logf("Running command: %v", makeCommand)
-		cmd = exec.Command(makeCommand[0], makeCommand[1:]...) // Will this work sanely on our builders?
-		cmd.Dir = filepath.Join(buildDir, "terraform-provider-juju")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			t.Fatalf("Error building terraform-provider-juju repo: %s", err)
-		}
+		runCommand(t,
+			makeCommand,
+			filepath.Join(buildDir, "terraform-provider-juju"),
+			"Error building terraform-provider-juju repo: %s")
 	}
 
 	t.Log("Getting GOPATH")
@@ -235,16 +191,24 @@ func destroyAndVerify(t *testing.T, options *terraform.Options, lastTimestamp ti
 }
 
 func waitAfterDestroy(t *testing.T, lastTimestamp time.Time) {
-	cmd := exec.Command("juju", "wait-for", "model", "main")
+	runCommand(t,
+		[]string{"juju", "wait-for", "model", "main"},
+		"",
+		"Error waiting for the model to settle: %s")
+	timestamp := time.Now()
+	duration := timestamp.Sub(lastTimestamp)
+	t.Logf("Post-apply time waiting until model settled: %v\n", duration)
+}
+
+func runCommand(t *testing.T, cmdLine []string, dir string, errorMessage string) {
+	cmd := exec.Command(cmdLine[0], cmdLine[1:]...)
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	if err != nil {
-		t.Fatal("Error waiting for the model to settle")
+		t.Fatalf(errorMessage, err)
 	}
-	timestamp := time.Now()
-	duration := timestamp.Sub(lastTimestamp)
-	t.Logf("Post-apply time waiting until model settled: %v\n", duration)
 }
 
 func verifyApply(t *testing.T, applyOutput string) {
@@ -352,24 +316,7 @@ func verifyDestroy(t *testing.T, applyOutput string) {
 	}
 }
 
-func copyFile(source string, dest string) {
-	input, err := os.Open(source)
-	if err != nil {
-		log.Fatalf("Could not open source %s: %s", source, err)
-	}
-	defer input.Close()
-	output, err := os.Create(dest)
-	if err != nil {
-		log.Fatalf("Could not open destination %s: %s", dest, err)
-	}
-	defer output.Close()
-	_, err = io.Copy(output, input)
-	if err != nil {
-		log.Fatalf("Unexpected error on io.Copy: %s", err)
-	}
-}
-
-func writeVersionsTf(path string, providerVersion string) {
+func writeVersionsTf(providerVersion string) {
 	// Note: insecure.  Accepts arbitrary strings.
 	template := `terraform {
   required_providers {
@@ -381,9 +328,10 @@ func writeVersionsTf(path string, providerVersion string) {
 }
 `
 	rendered := fmt.Sprintf(template, providerVersion)
-	output, err := os.Create(path)
+	outputPath := "versions.tf"
+	output, err := os.Create(outputPath)
 	if err != nil {
-		log.Fatalf("Could not open file %s: %s", path, err)
+		log.Fatalf("Could not open file %s: %s", outputPath, err)
 	}
 	output.WriteString(rendered)
 }
