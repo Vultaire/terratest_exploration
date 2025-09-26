@@ -88,7 +88,7 @@ func applyAndVerify(t *testing.T, options *terraform.Options) time.Time {
 	applyOutput := terraform.InitAndApply(t, options)
 	timestamp := time.Now()
 	duration := timestamp.Sub(startTime)
-	t.Logf("Initial terraform apply time: %v\n", duration)
+	printMetric(t, "applyDuration", duration)
 	verifyApply(t, applyOutput)
 	return timestamp
 }
@@ -101,7 +101,7 @@ func waitAfterApply(t *testing.T, queryParam string, lastTimestamp time.Time) ti
 		"Error waiting for the model to settle: %s")
 	timestamp := time.Now()
 	duration := timestamp.Sub(lastTimestamp)
-	t.Logf("Post-apply time waiting until model settled: %v\n", duration)
+	printMetric(t, "applyWaitDuration", duration)
 	return timestamp
 }
 
@@ -176,7 +176,7 @@ func applyAndReVerify(t *testing.T, options *terraform.Options, lastTimestamp ti
 	applyOutput := terraform.InitAndApply(t, options)
 	timestamp := time.Now()
 	duration := timestamp.Sub(lastTimestamp)
-	t.Logf("New provider terraform apply time: %v\n", duration)
+	printMetric(t, "reApplyDuration", duration)
 	verifyReApply(t, applyOutput)
 	return timestamp
 }
@@ -185,7 +185,7 @@ func destroyAndVerify(t *testing.T, options *terraform.Options, lastTimestamp ti
 	destroyOutput := terraform.Destroy(t, options)
 	timestamp := time.Now()
 	duration := timestamp.Sub(lastTimestamp)
-	t.Logf("Terraform destroy time: %v\n", duration)
+	printMetric(t, "destroyDuration", duration)
 	verifyDestroy(t, destroyOutput)
 	return timestamp
 }
@@ -197,7 +197,7 @@ func waitAfterDestroy(t *testing.T, lastTimestamp time.Time) {
 		"Error waiting for the model to settle: %s")
 	timestamp := time.Now()
 	duration := timestamp.Sub(lastTimestamp)
-	t.Logf("Post-apply time waiting until model settled: %v\n", duration)
+	printMetric(t, "destroyWaitDuration", duration)
 }
 
 func runCommand(t *testing.T, cmdLine []string, dir string, errorMessage string) {
@@ -209,6 +209,10 @@ func runCommand(t *testing.T, cmdLine []string, dir string, errorMessage string)
 	if err != nil {
 		t.Fatalf(errorMessage, err)
 	}
+}
+
+func printMetric(t *testing.T, metricName string, value any) {
+	t.Logf("TestMetric:%s=%v\n", metricName, value)
 }
 
 func verifyApply(t *testing.T, applyOutput string) {
