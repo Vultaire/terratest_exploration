@@ -1,4 +1,4 @@
-variable "tags" {
+variable "shared_tags" {
     type        = string
     description = "Shared tags for all app constraints"
 }

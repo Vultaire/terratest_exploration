@@ -12,7 +12,7 @@ resource "juju_application" "ubuntu" {
         base = "ubuntu@22.04"
     }
 
-    constraints = "tags=${var.tags},${var.physical_tags}"
+    constraints = "tags=${var.shared_tags},${var.physical_tags}"
 
     units = 1
 }
