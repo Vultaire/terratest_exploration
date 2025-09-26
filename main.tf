@@ -12,5 +12,7 @@ resource "juju_application" "ubuntu" {
         base = "ubuntu@22.04"
     }
 
+    constraints = "tags=^virtual"
+
     units = 1
 }
